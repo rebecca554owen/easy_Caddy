@@ -16,7 +16,207 @@ CADDY_CONFIG_DIR="/etc/caddy"
 BACKUP_CADDYFILE="${CADDYFILE}.bak"
 
 # 反向代理配置存储
-PROXY_CONFIG_FILE="/root/caddy_reverse_proxies.txt"
+PROXY_CONFIG_FILE="/etc/caddy/caddy_reverse_proxies.txt"
+
+function is_valid_port() {
+    local port=$1
+    if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+
+    if (( port < 1 || port > 65535 )); then
+        return 1
+    fi
+
+    return 0
+}
+
+function is_valid_host() {
+    local host=$1
+
+    if [[ "$host" == "localhost" ]]; then
+        return 0
+    fi
+
+    if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local octet
+        IFS='.' read -r -a octets <<< "$host"
+        for octet in "${octets[@]}"; do
+            if (( octet < 0 || octet > 255 )); then
+                return 1
+            fi
+        done
+        return 0
+    fi
+
+    if [[ "$host" =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])$ ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+function is_valid_site_address() {
+    local site=$1
+
+    if [[ "$site" =~ ^:[0-9]+$ ]]; then
+        is_valid_port "${site#:}"
+        return $?
+    fi
+
+    if [[ "$site" =~ ^localhost(:[0-9]+)?$ ]]; then
+        if [[ "$site" == *:* ]]; then
+            is_valid_port "${site##*:}"
+            return $?
+        fi
+        return 0
+    fi
+
+    if [[ "$site" =~ ^(\*\.)?([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])(:[0-9]+)?$ ]]; then
+        if [[ "$site" == *:* ]]; then
+            is_valid_port "${site##*:}"
+            return $?
+        fi
+        return 0
+    fi
+
+    return 1
+}
+
+function normalize_upstream_path() {
+    local path=$1
+
+    if [[ -z "$path" ]]; then
+        echo ""
+        return 0
+    fi
+
+    if [[ "$path" != /* ]]; then
+        return 1
+    fi
+
+    if [[ "$path" =~ [[:space:]#?] ]]; then
+        return 1
+    fi
+
+    if [[ ! "$path" =~ ^/[A-Za-z0-9._~/%-]*$ ]]; then
+        return 1
+    fi
+
+    while [[ "$path" == */ && "$path" != "/" ]]; do
+        path=${path%/}
+    done
+
+    if [[ "$path" == "/" ]]; then
+        echo ""
+    else
+        echo "$path"
+    fi
+}
+
+function parse_host_port_path() {
+    local raw=$1
+    local host_port=""
+    local path=""
+    local host=""
+    local port=""
+
+    if [[ "$raw" == */* ]]; then
+        host_port="${raw%%/*}"
+        path="/${raw#*/}"
+    else
+        host_port="$raw"
+    fi
+
+    if [[ "$host_port" != *:* ]]; then
+        return 1
+    fi
+
+    host="${host_port%:*}"
+    port="${host_port##*:}"
+
+    if ! is_valid_host "$host"; then
+        return 1
+    fi
+
+    if ! is_valid_port "$port"; then
+        return 1
+    fi
+
+    path=$(normalize_upstream_path "$path") || return 1
+    echo "${host}|${port}|${path}"
+}
+
+function render_proxy_block() {
+    local domain=$1
+    local upstream=$2
+    local scheme=""
+    local rest=""
+    local proxy_upstream=""
+    local upstream_path=""
+
+    if [[ "$upstream" == http://* ]]; then
+        scheme="http"
+        rest="${upstream#http://}"
+    else
+        scheme="https"
+        rest="${upstream#https://}"
+    fi
+
+    proxy_upstream="${scheme}://${rest%%/*}"
+    if [[ "$rest" == */* ]]; then
+        upstream_path="/${rest#*/}"
+    fi
+
+    echo "${domain} {"
+    if [ -n "$upstream_path" ]; then
+        echo "    @proxy_path path ${upstream_path} ${upstream_path}/*"
+        echo "    reverse_proxy @proxy_path ${proxy_upstream} {"
+    else
+        echo "    reverse_proxy ${proxy_upstream} {"
+    fi
+    echo "        lb_try_duration 600s"
+    echo "        flush_interval -1"
+    echo "        transport http {"
+    echo "            dial_timeout 30s"
+    echo "            response_header_timeout 600s"
+    echo "            read_timeout 600s"
+    echo "            write_timeout 600s"
+    if [ "$scheme" = "https" ]; then
+        echo "            tls"
+    fi
+    echo "        }"
+    echo "    }"
+    echo "}"
+}
+
+function validate_caddy_config_file() {
+    local config_file=$1
+    sudo caddy validate --config "$config_file" --adapter caddyfile >/dev/null
+}
+
+function apply_caddy_config() {
+    local candidate_file=$1
+
+    if ! validate_caddy_config_file "$candidate_file"; then
+        echo "Caddy 配置校验失败，未应用新配置。"
+        return 1
+    fi
+
+    sudo cp "$CADDYFILE" "$BACKUP_CADDYFILE.rollback"
+    sudo cp "$candidate_file" "$CADDYFILE"
+
+    if sudo systemctl reload caddy; then
+        sudo rm -f "$BACKUP_CADDYFILE.rollback"
+        return 0
+    fi
+
+    echo "Caddy 重新加载失败，正在回滚配置..."
+    sudo cp "$BACKUP_CADDYFILE.rollback" "$CADDYFILE"
+    sudo systemctl reload caddy >/dev/null 2>&1
+    sudo rm -f "$BACKUP_CADDYFILE.rollback"
+    return 1
+}
 
 #--------------------------------------------
 # 检查 Caddy 是否已安装
@@ -62,18 +262,123 @@ function install_caddy() {
 # 检查指定端口服务是否在运行
 #--------------------------------------------
 function check_port_running() {
-    local port=$1
-    if timeout 1 bash -c "echo > /dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+    local host=$1
+    local port=$2
+    if timeout 1 bash -c "echo > /dev/tcp/${host}/${port}" 2>/dev/null; then
         echo "运行中"
     else
         echo "未运行"
     fi
 }
 
+function normalize_upstream() {
+    local raw=$1
+    local normalized=${raw}
+    local parsed=""
+    local host=""
+    local port=""
+    local path=""
+
+    while [[ "$normalized" == */ ]]; do
+        normalized=${normalized%/}
+    done
+
+    if [[ "$normalized" =~ ^[0-9]{1,5}$ ]]; then
+        if ! is_valid_port "$normalized"; then
+            return 1
+        fi
+        echo "http://127.0.0.1:${normalized}"
+        return 0
+    fi
+
+    parsed=$(parse_host_port_path "$normalized")
+    if [ $? -eq 0 ]; then
+        IFS='|' read -r host port path <<< "$parsed"
+        echo "http://${host}:${port}${path}"
+        return 0
+    fi
+
+    if [[ "$normalized" =~ ^https?:// ]]; then
+        local scheme=${normalized%%://*}
+        local rest=${normalized#*://}
+        local host_port=""
+
+        if [[ "$rest" == */* ]]; then
+            host_port="${rest%%/*}"
+            path="/${rest#*/}"
+        else
+            host_port="$rest"
+            path=""
+        fi
+
+        if [[ "$host_port" == *:* ]]; then
+            parsed=$(parse_host_port_path "$rest")
+            if [ $? -eq 0 ]; then
+                IFS='|' read -r host port path <<< "$parsed"
+                echo "${scheme}://${host}:${port}${path}"
+                return 0
+            fi
+        else
+            host="$host_port"
+            if ! is_valid_host "$host"; then
+                return 1
+            fi
+            path=$(normalize_upstream_path "$path") || return 1
+            echo "${scheme}://${host}${path}"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+function get_upstream_host_port() {
+    local upstream=$1
+    local scheme=""
+    local host_port=""
+    local host=""
+    local port=""
+
+    if [[ "$upstream" == http://* ]]; then
+        scheme="http"
+        host_port="${upstream#http://}"
+    elif [[ "$upstream" == https://* ]]; then
+        scheme="https"
+        host_port="${upstream#https://}"
+    else
+        return 1
+    fi
+
+    host_port="${host_port%%/*}"
+
+    if [[ "$host_port" == *:* ]]; then
+        host="${host_port%:*}"
+        port="${host_port##*:}"
+    else
+        host="$host_port"
+        if [ "$scheme" = "https" ]; then
+            port="443"
+        else
+            port="80"
+        fi
+    fi
+
+    echo "${host} ${port}"
+}
+
+function write_proxy_block() {
+    local domain=$1
+    local upstream=$2
+    render_proxy_block "$domain" "$upstream" | sudo tee -a "$CADDYFILE" >/dev/null
+}
+
 #--------------------------------------------
-# 配置反向代理（输入域名及上游服务端口，自动构造上游地址）
+# 配置反向代理（输入域名及上游地址）
 #--------------------------------------------
 function setup_reverse_proxy() {
+    local upstream=""
+    local candidate_file=""
+
     echo "请输入域名（例如 example.com）："
     read domain
     if [ -z "$domain" ]; then
@@ -81,38 +386,51 @@ function setup_reverse_proxy() {
         return
     fi
 
-    echo "请输入上游服务端口（例如 8080）："
-    read port
-    if [ -z "$port" ]; then
-        echo "端口输入不能为空。"
+    if ! is_valid_site_address "$domain"; then
+        echo "域名格式无效，仅支持合法域名、通配域名、localhost、localhost:端口 或 :端口。"
         return
     fi
 
-    upstream="http://127.0.0.1:${port}"
+    echo "请输入上游地址（例如 127.0.0.1:3000、http://127.0.0.1:3000/api、https://example.com，或只输入端口 3000）："
+    read upstream_input
+    if [ -z "$upstream_input" ]; then
+        echo "上游地址不能为空。"
+        return
+    fi
+
+    upstream=$(normalize_upstream "$upstream_input")
+    if [ $? -ne 0 ]; then
+        echo "上游地址格式无效，仅支持 host:port、http://host、https://host、http://host:port、https://host:port、可选路径，或纯端口。"
+        return
+    fi
 
     # 检查 Caddyfile 是否备份过，没有则备份一下
     if [ ! -f "$BACKUP_CADDYFILE" ]; then
         sudo cp "$CADDYFILE" "$BACKUP_CADDYFILE"
     fi
 
-    # 添加新的反向代理配置到 Caddyfile
+    candidate_file=$(mktemp)
+    sudo cp "$CADDYFILE" "$candidate_file"
+    render_proxy_block "$domain" "$upstream" | sudo tee -a "$candidate_file" >/dev/null
+
     echo "配置反向代理：${domain} -> ${upstream}"
-    echo "${domain} {
-    reverse_proxy ${upstream}
-}" | sudo tee -a "$CADDYFILE" >/dev/null
+    if ! apply_caddy_config "$candidate_file"; then
+        rm -f "$candidate_file"
+        echo "新配置未生效。"
+        return
+    fi
+    rm -f "$candidate_file"
 
-    # 将配置信息保存到代理配置列表文件
-    echo "${domain} -> ${upstream}" >> "$PROXY_CONFIG_FILE"
+    echo "${domain} -> ${upstream}" | sudo tee -a "$PROXY_CONFIG_FILE" >/dev/null
 
-    # 重启 Caddy 以应用配置
-    echo "正在重启 Caddy 服务以应用新配置..."
-    sudo systemctl restart caddy
+    echo "新配置已生效。"
 
     # 检查上游服务状态
-    status=$(check_port_running "$port")
-    echo "上游服务（127.0.0.1:${port}）状态：$status"
+    read upstream_host upstream_port < <(get_upstream_host_port "$upstream")
+    status=$(check_port_running "$upstream_host" "$upstream_port")
+    echo "上游服务（${upstream_host}:${upstream_port}）状态：$status"
     echo "Caddy 服务状态："
-    sudo systemctl status caddy --no-pager
+    systemctl status caddy --no-pager
 }
 
 #--------------------------------------------
@@ -121,7 +439,7 @@ function setup_reverse_proxy() {
 function show_caddy_status() {
     if check_caddy_installed; then
         echo "Caddy 服务状态："
-        sudo systemctl status caddy --no-pager
+        systemctl status caddy --no-pager
     else
         echo "系统中未安装 Caddy。"
     fi
@@ -131,14 +449,23 @@ function show_caddy_status() {
 # 查看反向代理配置，并显示上游服务状态
 #--------------------------------------------
 function show_reverse_proxies() {
+    local upstream=""
+    local upstream_host=""
+    local upstream_port=""
+    local status=""
+
     if [ -f "$PROXY_CONFIG_FILE" ]; then
         echo "当前反向代理配置："
         lineno=0
         while IFS= read -r line; do
             lineno=$((lineno+1))
-            # 从配置行中提取端口（假定格式为 "域名 -> http://127.0.0.1:端口"）
-            port=$(echo "$line" | grep -oE '[0-9]{2,5}$')
-            status=$(check_port_running "$port")
+            upstream=$(echo "$line" | awk -F' -> ' '{print $2}')
+            upstream=$(normalize_upstream "$upstream")
+            if [ $? -eq 0 ] && read upstream_host upstream_port < <(get_upstream_host_port "$upstream"); then
+                status=$(check_port_running "$upstream_host" "$upstream_port")
+            else
+                status="配置无效"
+            fi
             echo "${lineno}) ${line} [上游服务状态：$status]"
         done < "$PROXY_CONFIG_FILE"
     else
@@ -150,36 +477,76 @@ function show_reverse_proxies() {
 # 删除指定的反向代理
 #--------------------------------------------
 function delete_reverse_proxy() {
+    local proxy_count=0
+    local candidate_file=""
+    local temp_proxy_file=""
+    local original_upstream=""
+
     show_reverse_proxies
     echo "请输入要删除的反向代理配置编号："
     read proxy_number
-    if [ -z "$proxy_number" ]; then
+    if [[ ! "$proxy_number" =~ ^[0-9]+$ ]] || [ "$proxy_number" -le 0 ]; then
         echo "无效的输入。"
         return
     fi
 
-    # 删除对应行
-    sed -i "${proxy_number}d" "$PROXY_CONFIG_FILE"
-
-    # 重新生成 Caddyfile 配置（恢复为备份版本）
-    echo "重新生成 Caddyfile 配置..."
-    sudo cp "$BACKUP_CADDYFILE" "$CADDYFILE"
-
-    # 根据代理配置列表重新添加剩余配置
-    if [ -f "$PROXY_CONFIG_FILE" ]; then
-        while IFS= read -r line; do
-            # 解析格式 "域名 -> http://127.0.0.1:端口"
-            domain=$(echo "$line" | awk -F' -> ' '{print $1}')
-            upstream=$(echo "$line" | awk -F' -> ' '{print $2}')
-            echo "${domain} {
-    reverse_proxy ${upstream}
-}" | sudo tee -a "$CADDYFILE" >/dev/null
-        done < "$PROXY_CONFIG_FILE"
+    if [ ! -f "$PROXY_CONFIG_FILE" ]; then
+        echo "没有可删除的反向代理配置。"
+        return
     fi
 
-    # 重启 Caddy 服务
-    echo "重启 Caddy 服务..."
-    sudo systemctl restart caddy
+    proxy_count=$(wc -l < "$PROXY_CONFIG_FILE")
+    if [ "$proxy_number" -gt "$proxy_count" ]; then
+        echo "编号超出范围。"
+        return
+    fi
+
+    if [ ! -f "$BACKUP_CADDYFILE" ]; then
+        echo "未找到 Caddyfile 备份，无法安全重建配置。"
+        return
+    fi
+
+    candidate_file=$(mktemp)
+    temp_proxy_file=$(mktemp)
+    sudo cp "$BACKUP_CADDYFILE" "$candidate_file"
+    sudo cp "$PROXY_CONFIG_FILE" "$temp_proxy_file"
+
+    sed -i "${proxy_number}d" "$temp_proxy_file"
+
+    if [ -s "$temp_proxy_file" ]; then
+        while IFS= read -r line; do
+            # 解析格式 "域名 -> 上游地址"
+            domain=$(echo "$line" | awk -F' -> ' '{print $1}')
+            upstream=$(echo "$line" | awk -F' -> ' '{print $2}')
+            original_upstream="$upstream"
+            if ! is_valid_site_address "$domain"; then
+                echo "发现无效域名记录：${domain}"
+                rm -f "$candidate_file" "$temp_proxy_file"
+                return
+            fi
+            upstream=$(normalize_upstream "$upstream")
+            if [ $? -ne 0 ]; then
+                echo "发现无效上游记录：${original_upstream}"
+                rm -f "$candidate_file" "$temp_proxy_file"
+                return
+            fi
+            render_proxy_block "$domain" "$upstream" | sudo tee -a "$candidate_file" >/dev/null
+        done < "$temp_proxy_file"
+    fi
+
+    if ! apply_caddy_config "$candidate_file"; then
+        rm -f "$candidate_file" "$temp_proxy_file"
+        echo "删除后的配置未生效。"
+        return
+    fi
+
+    if [ -s "$temp_proxy_file" ]; then
+        sudo cp "$temp_proxy_file" "$PROXY_CONFIG_FILE"
+    else
+        sudo rm -f "$PROXY_CONFIG_FILE"
+    fi
+
+    rm -f "$candidate_file" "$temp_proxy_file"
     echo "反向代理删除成功！"
 }
 
@@ -190,7 +557,7 @@ function restart_caddy() {
     echo "正在重启 Caddy 服务..."
     sudo systemctl restart caddy
     echo "Caddy 服务已重启。"
-    sudo systemctl status caddy --no-pager
+    systemctl status caddy --no-pager
 }
 
 #--------------------------------------------
@@ -241,7 +608,7 @@ function show_menu() {
     echo "           Caddy 一键部署 & 管理脚本          "
     echo "============================================="
     echo " 1) 安装 Caddy（如已安装则跳过）"
-    echo " 2) 配置 & 启用反向代理（输入域名及上游端口）"
+    echo " 2) 配置 & 启用反向代理（输入域名及上游地址）"
     echo " 3) 查看 Caddy 服务状态"
     echo " 4) 查看当前反向代理配置（显示上游服务状态）"
     echo " 5) 删除指定的反向代理"

@@ -14,8 +14,18 @@ Caddy 一键部署 & 管理脚本  ==================
 
 支持 Debian/Ubuntu系统
 
-通过以下命令一键安装和启动 Caddy 服务：
+配置反向代理时，上游地址支持 `127.0.0.1:3000`、`http://127.0.0.1:3000/api`、`https://example.com`，或只输入端口 `3000`。末尾多余的 `/` 会自动去掉；带路径时只转发相同路径和子路径，例如 `/api` 和 `/api/*`。
+
+请选择以下任意一种方式一键安装和启动 Caddy 服务：
+
+方式一：下载脚本后执行
 
 ```bash
-curl -o easyCaddy.sh https://raw.githubusercontent.com/HlONGlin/easy_Caddy/refs/heads/main/easyCaddy.sh && chmod +x easyCaddy.sh && ./easyCaddy.sh
+curl -o easyCaddy.sh https://raw.githubusercontent.com/rebecca554owen/easy_Caddy/refs/heads/main/easyCaddy.sh && chmod +x easyCaddy.sh && ./easyCaddy.sh
+```
 
+方式二：直接通过 bash 执行远程脚本
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/rebecca554owen/easy_Caddy/refs/heads/main/easyCaddy.sh)"
+```
