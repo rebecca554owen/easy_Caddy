@@ -16,6 +16,15 @@ Caddy 一键部署 & 管理脚本  ==================
 
 配置反向代理时，上游地址支持 `127.0.0.1:3000`、`http://127.0.0.1:3000/api`、`https://example.com`，或只输入端口 `3000`。末尾多余的 `/` 会自动去掉；带路径时只转发相同路径和子路径，例如 `/api` 和 `/api/*`。
 
+常见问题：
+
+- `caddy.service is not active, cannot reload`：表示 Caddy 当前没有运行。脚本会在 Caddy 未运行时自动改用 `systemctl restart caddy` 来启动并加载配置。
+- `sudo: unable to resolve host xxx: Name or service not known`：这是系统 hostname 没有写入 `/etc/hosts`，不是 Caddy 配置错误。可用 `hostname` 查看当前主机名，然后把主机名加入 `/etc/hosts`，例如：
+
+```bash
+echo "127.0.1.1 $(hostname)" | sudo tee -a /etc/hosts
+```
+
 请选择以下任意一种方式一键安装和启动 Caddy 服务：
 
 方式一：下载脚本后执行

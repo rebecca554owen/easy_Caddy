@@ -10,6 +10,8 @@
 #   7) 一键删除 Caddy（卸载并删除配置文件）
 # 适用于 Debian/Ubuntu 系列系统
 
+SCRIPT_VERSION="1.1.0"
+
 # Caddyfile 默认路径
 CADDYFILE="/etc/caddy/Caddyfile"
 CADDY_CONFIG_DIR="/etc/caddy"
@@ -197,23 +199,37 @@ function validate_caddy_config_file() {
 
 function apply_caddy_config() {
     local candidate_file=$1
+    local was_active=0
 
     if ! validate_caddy_config_file "$candidate_file"; then
         echo "Caddy 配置校验失败，未应用新配置。"
         return 1
     fi
 
+    if sudo systemctl is-active --quiet caddy; then
+        was_active=1
+    fi
+
     sudo cp "$CADDYFILE" "$BACKUP_CADDYFILE.rollback"
     sudo cp "$candidate_file" "$CADDYFILE"
 
-    if sudo systemctl reload caddy; then
+    if [ "$was_active" -eq 1 ]; then
+        if sudo systemctl reload caddy || sudo systemctl restart caddy; then
+            sudo rm -f "$BACKUP_CADDYFILE.rollback"
+            return 0
+        fi
+    elif sudo systemctl restart caddy; then
         sudo rm -f "$BACKUP_CADDYFILE.rollback"
         return 0
     fi
 
-    echo "Caddy 重新加载失败，正在回滚配置..."
+    echo "Caddy 应用配置失败，正在回滚配置..."
     sudo cp "$BACKUP_CADDYFILE.rollback" "$CADDYFILE"
-    sudo systemctl reload caddy >/dev/null 2>&1
+    if [ "$was_active" -eq 1 ]; then
+        sudo systemctl reload caddy >/dev/null 2>&1 || sudo systemctl restart caddy >/dev/null 2>&1
+    else
+        sudo systemctl stop caddy >/dev/null 2>&1
+    fi
     sudo rm -f "$BACKUP_CADDYFILE.rollback"
     return 1
 }
@@ -606,6 +622,7 @@ function show_menu() {
         echo "Caddy 状态：未运行"
     fi
     echo "           Caddy 一键部署 & 管理脚本          "
+    echo "           脚本版本：${SCRIPT_VERSION}                 "
     echo "============================================="
     echo " 1) 安装 Caddy（如已安装则跳过）"
     echo " 2) 配置 & 启用反向代理（输入域名及上游地址）"
