@@ -38,3 +38,21 @@ curl -o easyCaddy.sh https://raw.githubusercontent.com/rebecca554owen/easy_Caddy
 ```bash
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/rebecca554owen/easy_Caddy/refs/heads/main/easyCaddy.sh)"
 ```
+
+## AI Skill
+
+仓库内维护了一个 Codex skill：`skills/manage-caddy`。它用于让 AI 在目标 Debian/Ubuntu 服务器上直接完成 Caddy 安装、反向代理配置、校验、重载/启动、删除、卸载和常见故障排查。
+
+复制到本地 Codex skills 目录：
+
+```bash
+mkdir -p ~/.codex/skills
+cp -R skills/manage-caddy ~/.codex/skills/
+```
+
+或使用软链接，方便跟随仓库更新：
+
+```bash
+mkdir -p ~/.codex/skills
+ln -s "$(pwd)/skills/manage-caddy" ~/.codex/skills/manage-caddy
+```

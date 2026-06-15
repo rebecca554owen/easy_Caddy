@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manage Caddy"
+  short_description: "Install and manage Caddy reverse proxies"
+  default_prompt: "Use $manage-caddy to configure a Caddy reverse proxy on this Debian or Ubuntu server."
